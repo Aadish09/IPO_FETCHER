@@ -1,0 +1,36 @@
+name: Scheduled IPO Agent (one-shot)
+
+on:
+  workflow_dispatch:
+  schedule:
+    # every 30 minutes (adjust as needed)
+    - cron: '*/30 * * * *'
+
+jobs:
+  run-once:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install requests pdfplumber; fi
+
+      - name: Run IPO agent (one-shot)
+        env:
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          POLL_INTERVAL_SECONDS: "60"
+          ONE_SHOT: "1"
+        run: |
+          # run one cycle and exit; script respects --once or ONE_SHOT env var
+          python zero_db_ipo_agent.py --once
