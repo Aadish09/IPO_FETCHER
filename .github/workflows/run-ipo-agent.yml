@@ -1,18 +1,18 @@
-name: Fetch IPOAlerts Open (15 pages) — hosted runner
+name: Fetch IPOAlerts Open (run script) - hosted runner
 
 on:
   workflow_dispatch:
   schedule:
-    # every 30 minutes (adjust as needed)
-    - cron: '*/30 * * * *'
+    # every 1 hour
+    - cron: '0 * * * *'
 
 jobs:
   fetch-ipos:
-    runs-on: ubuntu-22.04   # or ubuntu-latest
-    timeout-minutes: 15
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python 3.11
@@ -23,34 +23,13 @@ jobs:
       - name: Install dependencies
         run: python -m pip install --upgrade pip && pip install requests beautifulsoup4
 
-      - name: Run IPO fetch script (inline)
+      - name: Run IPO agent script (one-shot)
         env:
           IPOALERTS_API_KEY: ${{ secrets.IPOALERTS_API_KEY }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}    # optional if you want Telegram
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}    # optional
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}        # optional
+          POLL_INTERVAL_SECONDS: '3600'
         run: |
-          python - <<'PY'
-          import os, requests, time
-          API_KEY = os.getenv("IPOALERTS_API_KEY")
-          if not API_KEY:
-              raise SystemExit("IPOALERTS_API_KEY not provided")
-          BASE = "https://api.ipoalerts.in/ipos"
-          headers = {"x-api-key": API_KEY, "Content-Type": "application/json"}
-          results = []
-          for page in range(1,16):
-              params = {"status":"open","limit":1,"page":page}
-              print(f"calling page {page} ...")
-              r = requests.get(BASE, headers=headers, params=params, timeout=15)
-              if r.status_code != 200:
-                  print("error", r.status_code, r.text[:200])
-                  time.sleep(1)
-                  continue
-              data = r.json()
-              items = data.get("data", [])
-              if items:
-                  results.extend(items)
-              time.sleep(1)
-          print("\\nCollected:", len(results))
-          for ipo in results:
-              print(ipo.get("company_name"), ipo.get("symbol"), ipo.get("price_low"), ipo.get("price_high"))
-          PY
+          # make script executable if needed and run one-shot
+          # adjust path if your script is located elsewhere
+          python zero_db_ipo_agent.py --once
