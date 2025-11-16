@@ -2,9 +2,9 @@ name: CI — IPO Agent
 
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: ["main", "master"]
   pull_request:
-    branches: [ "main", "master" ]
+    branches: ["main", "master"]
   workflow_dispatch:
 
 jobs:
@@ -42,8 +42,6 @@ jobs:
           python -m compileall .
 
       - name: Smoke test — import module
-        # We import module (does not run the long-running main_loop)
-        # This checks code loads (no syntax errors or missing imports).
         run: |
           python - <<'PY'
           try:
@@ -55,8 +53,17 @@ jobs:
               raise
           PY
 
-      - name: (Optional) Run tests if present
-        if: ${{ exists('tests') }}
+      - name: Check for tests directory
+        id: check_tests
+        run: |
+          if [ -d "tests" ]; then
+            echo "has_tests=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_tests=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run tests if present
+        if: ${{ steps.check_tests.outputs.has_tests == 'true' }}
         run: |
           pip install pytest
           pytest -q
