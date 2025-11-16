@@ -106,7 +106,7 @@ def fetch_ipoalerts_15_pages() -> List[Dict[str, Any]]:
     ts_run = datetime.utcnow().isoformat()
     ipoalerts_raw_state.setdefault("runs", []).append({"ts": ts_run, "pages_called": []})
 
-    for page in range(1, 16):  # pages 1..15
+    for page in range(1, 3):  # pages 1..15
         params = {"status": "open", "limit": 1, "page": page}
         url = f"{IPOALERTS_BASE}{IPOALERTS_IPOS_PATH}"
         try:
