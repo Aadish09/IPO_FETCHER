@@ -1,28 +1,36 @@
 #!/usr/bin/env python3
 """
-Zero-DB IPO Agent with Finnhub integration.
+Zero-DB IPO Agent with Finnhub integration — single-file agent.
+
+Features:
+- Finnhub IPO calendar ingestion (7-day default window).
+- GMP aggregator placeholders (add real sources/parsers).
+- Persists state to local JSON files in ./data/ (no SQL DB).
+- Telegram notifier (optional) — uses TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID env vars.
+- Supports one-shot mode via `--once` CLI flag or ONE_SHOT=1 env var for CI/Actions.
 
 Usage:
-1. pip install requests pdfplumber
-2. export TELEGRAM_BOT_TOKEN="12345:ABC..."
-   export TELEGRAM_CHAT_ID="987654321"
-   export FINNHUB_API_KEY="d4cp5uhr01qudf6jdbj0d4cp5uhr01qudf6jdbjg"
-   export POLL_INTERVAL_SECONDS=300   # optional
-3. python zero_db_ipo_agent.py
+  pip install requests pdfplumber
+  export FINNHUB_API_KEY="..."
+  export TELEGRAM_BOT_TOKEN="..."            # optional
+  export TELEGRAM_CHAT_ID="..."              # optional
+  python zero_db_ipo_agent.py --once
 """
 
+from __future__ import annotations
 import os
 import json
 import time
-import math
+import argparse
 import statistics
 import requests
-from decimal import Decimal
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 
-# ----- Config -----
-POLL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "300"))  # default 5 minutes
+# -------------------------
+# Config (env / defaults)
+# -------------------------
+POLL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "300"))  # fallback poll interval
 DATA_DIR = os.path.join(os.getcwd(), "data")
 IPOS_FILE = os.path.join(DATA_DIR, "ipos.json")
 GMP_FILE = os.path.join(DATA_DIR, "gmp.json")
@@ -33,26 +41,27 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
 
-# GMP sources (placeholder). Replace with real URLs/APIs.
+# Replace/add real GMP source URLs here (placeholders)
 GMP_SOURCES = [
-    # Add real GMP page URLs here
     # "https://example-gmp-source-1.com/ipo/gmp/example-corp",
     # "https://example-gmp-source-2.com/gmp/example-corp"
 ]
 
-# Simple threshold for demo notify (INR)
-GMP_NOTIFY_THRESHOLD = 50.0
+# notify if GMP median >= threshold (example)
+GMP_NOTIFY_THRESHOLD = float(os.getenv("GMP_NOTIFY_THRESHOLD", "50.0"))
 
-# Finnhub settings
+# Finnhub HTTP helpers
 FINNHUB_BASE = "https://finnhub.io/api/v1"
 FINNHUB_MAX_RETRIES = 5
-FINNHUB_RETRY_BACKOFF = 2.0  # exponential base seconds
+FINNHUB_RETRY_BACKOFF = 2.0
 
-# ----- Utilities: file-based state -----
+# -------------------------
+# File utilities
+# -------------------------
 def ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
 
-def load_json(path: str) -> Dict:
+def load_json(path: str) -> Dict[str, Any]:
     if not os.path.exists(path):
         return {}
     try:
@@ -61,23 +70,26 @@ def load_json(path: str) -> Dict:
     except Exception:
         return {}
 
-def save_json(path: str, obj: Dict):
+def save_json(path: str, obj: Dict[str, Any]):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, default=str)
 
-# ----- In-memory file-backed state -----
+# -------------------------
+# In-memory state (file-backed)
+# -------------------------
 ensure_data_dir()
-ipos_state = load_json(IPOS_FILE)        # previous/known IPOs
-gmp_state = load_json(GMP_FILE) or {}    # historical gmp readings
-funds_state = load_json(FUND_FILE) or {} # stored fundamentals
-finnhub_raw_state = load_json(FINNHUB_RAW_FILE) or {}
+ipos_state: Dict[str, Any] = load_json(IPOS_FILE)
+gmp_state: Dict[str, Any] = load_json(GMP_FILE) or {}
+funds_state: Dict[str, Any] = load_json(FUND_FILE) or {}
+finnhub_raw_state: Dict[str, Any] = load_json(FINNHUB_RAW_FILE) or {}
 
-# ----- Finnhub ingestion -----
+# -------------------------
+# Finnhub client (GET with backoff)
+# -------------------------
 def finnhub_get(endpoint: str, params: dict, max_retries: int = FINNHUB_MAX_RETRIES) -> dict:
-    """
-    Simple GET with retry/backoff for Finnhub API.
-    Retries on 429 and transient 5xx errors.
-    """
+    if not FINNHUB_API_KEY:
+        print("FINNHUB_API_KEY not set — skipping Finnhub fetch.")
+        return {}
     headers = {"Accept": "application/json"}
     params = dict(params)
     params["token"] = FINNHUB_API_KEY
@@ -88,8 +100,7 @@ def finnhub_get(endpoint: str, params: dict, max_retries: int = FINNHUB_MAX_RETR
             if r.status_code == 200:
                 return r.json()
             if r.status_code == 429:
-                # rate limited — backoff and retry
-                print(f"Finnhub 429 rate limit; backing off {backoff}s (attempt {attempt+1}/{max_retries})")
+                print(f"Finnhub 429 rate-limited; backing off {backoff}s (attempt {attempt+1}/{max_retries})")
                 time.sleep(backoff)
                 backoff *= FINNHUB_RETRY_BACKOFF
                 continue
@@ -98,38 +109,25 @@ def finnhub_get(endpoint: str, params: dict, max_retries: int = FINNHUB_MAX_RETR
                 time.sleep(backoff)
                 backoff *= FINNHUB_RETRY_BACKOFF
                 continue
-            # other errors: raise
             r.raise_for_status()
         except requests.RequestException as e:
-            print("Finnhub request error:", str(e), f"(attempt {attempt+1}/{max_retries})")
+            print("Finnhub request exception:", e, f"(attempt {attempt+1}/{max_retries})")
             time.sleep(backoff)
             backoff *= FINNHUB_RETRY_BACKOFF
             continue
-    # if we get here, give up gracefully
-    print("Finnhub: exceeded retries, returning empty dict")
+    print("Finnhub: retries exhausted, returning empty dict.")
     return {}
 
 def map_finnhub_item_to_ipo(it: dict) -> dict:
-    """
-    Map a single Finnhub item to internal IPO dict format.
-    Keep raw item for provenance.
-    """
-    # Defensive extraction — Finnhub's keys may differ; save raw
     company = it.get("name") or it.get("company") or it.get("description") or it.get("title")
-    # Some responses may include 'symbol' or 'ticker'
     symbol = it.get("symbol") or it.get("ticker")
     exchange = it.get("exchange") or it.get("market")
-    # Finnhub often uses date fields like 'date' or 'expectedDate' — check multiple
     open_date = it.get("date") or it.get("expectedDate") or it.get("openDate")
     close_date = it.get("expectedEndDate") or it.get("expectedDateTo") or it.get("closeDate")
-    # price band may be absent from Finnhub; leave None if missing
-    price_low = it.get("priceLow") or it.get("price_band_low") or None
-    price_high = it.get("priceHigh") or it.get("price_band_high") or None
-
-    # derive a stable key — prefer symbol, else company name
-    key_source = (symbol or company or "") .strip().lower().replace(" ", "-")
+    price_low = it.get("priceLow") or it.get("price_low") or None
+    price_high = it.get("priceHigh") or it.get("price_high") or None
+    key_source = (symbol or company or "").strip().lower().replace(" ", "-")
     key = key_source if key_source else f"finnhub-{int(time.time())}"
-
     return {
         "key": key,
         "company_name": company,
@@ -146,41 +144,22 @@ def map_finnhub_item_to_ipo(it: dict) -> dict:
     }
 
 def fetch_finnhub_ipos_window(from_date: str, to_date: str) -> List[dict]:
-    """
-    Query Finnhub /calendar/ipo for the given YYYY-MM-DD window.
-    Returns mapped list of IPO dicts.
-    """
-    if not FINNHUB_API_KEY:
-        print("FINNHUB_API_KEY not set; cannot fetch Finnhub IPO calendar.")
-        return []
-
-    params = {"from": from_date, "to": to_date}
-    raw = finnhub_get("/calendar/ipo", params)
+    raw = finnhub_get("/calendar/ipo", {"from": from_date, "to": to_date})
     if not raw:
         return []
-
-    # save raw payload for provenance
     ts = datetime.utcnow().isoformat()
     finnhub_raw_state.setdefault("queries", []).append({"from": from_date, "to": to_date, "ts": ts, "payload": raw})
     save_json(FINNHUB_RAW_FILE, finnhub_raw_state)
-
-    # The precise JSON shape may vary across Finnhub SDK versions or docs; be defensive
     items = []
-    # Keys commonly used: 'data', 'ipoCalendar', or direct list
     if isinstance(raw, dict):
         if "ipoCalendar" in raw and isinstance(raw["ipoCalendar"], list):
             items = raw["ipoCalendar"]
         elif "data" in raw and isinstance(raw["data"], list):
             items = raw["data"]
         else:
-            # maybe the payload itself is a list-like dict with numeric keys — try flattening
             items = raw.get("items") or raw.get("results") or []
     elif isinstance(raw, list):
         items = raw
-    # If still empty and raw seems list-like, try using raw directly
-    if not items and isinstance(raw, list):
-        items = raw
-
     mapped = []
     for it in items:
         if not isinstance(it, dict):
@@ -188,13 +167,14 @@ def fetch_finnhub_ipos_window(from_date: str, to_date: str) -> List[dict]:
         mapped.append(map_finnhub_item_to_ipo(it))
     return mapped
 
-# Short helper: fetch next N days window ipos (today..today+days)
 def fetch_finnhub_ipos(days_window: int = 7) -> List[dict]:
     today = datetime.utcnow().date()
     to_date = today + timedelta(days=days_window)
     return fetch_finnhub_ipos_window(today.isoformat(), to_date.isoformat())
 
-# ----- GMP aggregator (file-based, same as before) -----
+# -------------------------
+# GMP aggregator (placeholder parsers)
+# -------------------------
 def parse_gmp_from_html_example(html: str) -> Optional[float]:
     import re
     m = re.search(r'GMP[:\s]*₹?\s*([0-9,\-\.]+)', html, flags=re.IGNORECASE)
@@ -238,7 +218,9 @@ def gather_gmp_for(ipo_key: str) -> Dict[str, Any]:
     confidence = max(0.0, 1.0 - (stdev / (abs(median) + 1))) if median != 0 else 0.0
     return {"median": median, "sources": sources_data, "confidence": confidence}
 
-# ----- Prospectus helper (optional) -----
+# -------------------------
+# Prospectus helper (optional)
+# -------------------------
 def extract_fundamentals_from_pdf(local_pdf_path: str) -> Dict[str, Any]:
     try:
         import pdfplumber
@@ -274,10 +256,12 @@ def extract_fundamentals_from_pdf(local_pdf_path: str) -> Dict[str, Any]:
                 out.setdefault("profit_rows", []).append(row)
     return out
 
-# ----- Notifier (Telegram) -----
+# -------------------------
+# Telegram notifier
+# -------------------------
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram token/chat not set; skipping send. Message would be:\n", text)
+        print("Telegram not configured — message would be:\n", text)
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
@@ -288,14 +272,15 @@ def send_telegram(text: str):
     except Exception as e:
         print("Telegram send exception:", e)
 
-# ----- Core logic: detect changes and notify -----
+# -------------------------
+# Core: detect and notify
+# -------------------------
 def detect_and_notify(current_ipos: List[Dict[str, Any]]):
     changed = False
     for ipo in current_ipos:
         key = ipo["key"]
         prev = ipos_state.get(key)
         if not prev:
-            # new IPO
             ipos_state[key] = ipo.copy()
             ipos_state[key]["seen_at"] = datetime.utcnow().isoformat()
             save_json(IPOS_FILE, ipos_state)
@@ -307,7 +292,6 @@ def detect_and_notify(current_ipos: List[Dict[str, Any]]):
                    f"Exchange: {ipo.get('exchange') or 'N/A'}\n")
             send_telegram(msg + "\n_Disclaimer: not investment advice._")
         else:
-            # existing IPO: check status change
             if prev.get("status") != ipo.get("status"):
                 old = prev.get("status")
                 ipos_state[key].update(ipo)
@@ -319,7 +303,6 @@ def detect_and_notify(current_ipos: List[Dict[str, Any]]):
                        f"{old} → {ipo.get('status')}\n")
                 send_telegram(msg + "\n_Disclaimer: not investment advice._")
 
-        # gather GMP and check threshold
         agg = gather_gmp_for(key)
         if agg:
             median = agg.get("median")
@@ -351,25 +334,39 @@ def detect_and_notify(current_ipos: List[Dict[str, Any]]):
     save_json(FUND_FILE, funds_state)
     return changed
 
-# ----- Main loop -----
-def main_loop():
-    print("Zero-DB IPO Agent with Finnhub starting. Data dir:", DATA_DIR)
+# -------------------------
+# Main loop + CLI arg parsing
+# -------------------------
+def run_cycle():
+    # By default, fetch next 7 days
+    current = fetch_finnhub_ipos(days_window=7)
+    if not current:
+        print("No IPOs returned by Finnhub this cycle.")
+    else:
+        detect_and_notify(current)
+
+def main_loop(one_shot: bool = False):
+    print("Zero-DB IPO Agent starting. Data dir:", DATA_DIR)
     save_json(IPOS_FILE, ipos_state)
     save_json(GMP_FILE, gmp_state)
     save_json(FUND_FILE, funds_state)
     save_json(FINNHUB_RAW_FILE, finnhub_raw_state)
 
+    if one_shot:
+        run_cycle()
+        print("One-shot run complete — exiting.")
+        return
+
     while True:
         try:
-            # fetch next 7 days by default
-            current = fetch_finnhub_ipos(days_window=7)
-            if not current:
-                print("No IPOs from Finnhub this cycle.")
-            else:
-                detect_and_notify(current)
+            run_cycle()
         except Exception as e:
             print("Main loop error:", e)
         time.sleep(POLL_SECONDS)
 
 if __name__ == "__main__":
-    main_loop()
+    parser = argparse.ArgumentParser(description="Zero-DB IPO Agent")
+    parser.add_argument("--once", action="store_true", help="Run one cycle and exit (good for CI)")
+    args = parser.parse_args()
+    ONE_SHOT = args.once or os.getenv("ONE_SHOT") == "1"
+    main_loop(one_shot=ONE_SHOT)
