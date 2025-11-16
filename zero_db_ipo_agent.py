@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Zero-DB IPO Agent (IPOAlerts 15-page fetch + Investorgain GMP scraper)
+Zero-DB IPO Agent (IPOAlerts 1-page test fetch + Investorgain GMP scraper)
 
-Key points:
-- IPOAlerts calls unchanged (15 pages, polite 1s sleep).
-- Investorgain scraper integrated into GMP aggregation.
-- GMP aggregation is done *in-memory only* — no persistence to disk.
-- Playwright fallback supported (optional) for JS-driven pages.
-- Rest of agent (ipos_state persistence, telegram sends) unchanged.
+Notes:
+- Temporarily limited IPOAlerts calls to a single page (page=1) for testing.
+- Once validated, we can restore multi-page behaviour or make it configurable.
+- Investorgain scraper and in-memory GMP aggregation remain unchanged.
+- Usage same as before.
 
 Usage:
   pip install requests beautifulsoup4
@@ -90,9 +89,16 @@ funds_state: Dict[str, Any] = load_json(FUND_FILE) or {}
 ipoalerts_raw_state: Dict[str, Any] = load_json(IPOALERTS_RAW_FILE) or {}
 
 # -------------------------
-# IPOAlerts: fetch 15 pages (status=open, limit=1) with sleep
+# IPOAlerts: fetch (TEST MODE: single page only)
 # -------------------------
 def fetch_ipoalerts_15_pages() -> List[Dict[str, Any]]:
+    """
+    TEST MODE: Calls IPOAlerts API once with:
+      GET /ipos?status=open&limit=1&page=1
+
+    Reads API key from IPOALERTS_API_KEY env var (x-api-key header).
+    Returns a list of normalized IPO dicts (internal shape expected by detect_and_notify).
+    """
     if not IPOALERTS_API_KEY:
         print("IPOALERTS_API_KEY not set — cannot call IPOAlerts API.")
         return []
@@ -106,7 +112,8 @@ def fetch_ipoalerts_15_pages() -> List[Dict[str, Any]]:
     ts_run = datetime.utcnow().isoformat()
     ipoalerts_raw_state.setdefault("runs", []).append({"ts": ts_run, "pages_called": []})
 
-    for page in range(1, 3):  # pages 1..15
+    # TEST MODE: only call page 1 once. Change range(1,2) -> range(1,16) to restore 15-page behaviour.
+    for page in range(1, 2):  # pages 1..1 (single call for testing)
         params = {"status": "open", "limit": 1, "page": page}
         url = f"{IPOALERTS_BASE}{IPOALERTS_IPOS_PATH}"
         try:
@@ -161,7 +168,6 @@ def fetch_ipoalerts_15_pages() -> List[Dict[str, Any]]:
         time.sleep(API_CALL_SLEEP)
 
     ipoalerts_raw_state["runs"][-1]["collected"] = len(collected)
-    # save lightweight provenance for IPOAlerts runs (optional)
     try:
         save_json(IPOALERTS_RAW_FILE, ipoalerts_raw_state)
     except Exception:
@@ -197,10 +203,6 @@ def parse_currency_to_float(s: str) -> Optional[float]:
 from bs4 import BeautifulSoup
 
 def fetch_investorgain_gmp_requests() -> Dict[str, Dict[str, Any]]:
-    """
-    Attempt to fetch GMP snapshot using plain requests + BeautifulSoup.
-    Returns mapping: key -> { company_name, gmp_value, gmp_raw, source, ts }
-    """
     out: Dict[str, Dict[str, Any]] = {}
     try:
         r = requests.get(INVESTORGAIN_GMP_URL, headers=INVESTORGAIN_HEADERS, timeout=12)
@@ -210,7 +212,6 @@ def fetch_investorgain_gmp_requests() -> Dict[str, Dict[str, Any]]:
         html = r.text
         soup = BeautifulSoup(html, "html.parser")
 
-        # try to find table by headings mentioning 'gmp' or 'live ipo gmp'
         table = None
         headings = soup.find_all(lambda tag: tag.name in ("h1", "h2", "h3", "h4") and "gmp" in tag.get_text(strip=True).lower())
         for h in headings:
@@ -230,8 +231,6 @@ def fetch_investorgain_gmp_requests() -> Dict[str, Dict[str, Any]]:
                 table = candidate_tables[0]
 
         if table is None:
-            # fallback: try to find rows in any div lists or content blocks
-            # return empty — Playwright fallback may work better
             return out
 
         rows = table.find_all("tr")
@@ -239,7 +238,6 @@ def fetch_investorgain_gmp_requests() -> Dict[str, Dict[str, Any]]:
             cols = [td.get_text(" ", strip=True) for td in tr.find_all(["td", "th"])]
             if not cols or len(cols) < 2:
                 continue
-            # skip header
             if tr.find("th"):
                 hdr = " ".join(cols).lower()
                 if "company" in hdr and ("gmp" in hdr or "premium" in hdr):
@@ -247,11 +245,9 @@ def fetch_investorgain_gmp_requests() -> Dict[str, Dict[str, Any]]:
             company = None
             gmp_val = None
             gmp_raw = None
-            # pick company: first text-like column
             for c in cols:
                 if company is None and re.search(r"[A-Za-z]", c) and not _num_re.fullmatch(c.replace(",", "")):
                     company = c
-            # find numeric-like column from right
             for c in reversed(cols):
                 parsed = parse_currency_to_float(c)
                 if parsed is not None:
@@ -273,13 +269,11 @@ def fetch_investorgain_gmp_requests() -> Dict[str, Dict[str, Any]]:
         print("investorgain requests parse error:", e)
         return {}
 
-# optional Playwright fallback for JS-rendered content
 def fetch_investorgain_gmp_playwright() -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
     try:
         from playwright.sync_api import sync_playwright
     except Exception:
-        # playwright not installed
         return out
 
     try:
@@ -287,7 +281,6 @@ def fetch_investorgain_gmp_playwright() -> Dict[str, Dict[str, Any]]:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page(user_agent=INVESTORGAIN_HEADERS["User-Agent"])
             page.goto(INVESTORGAIN_GMP_URL, timeout=30000)
-            # wait for table or some content - tune selector if needed
             try:
                 page.wait_for_selector("table, .report_content, #main", timeout=10000)
             except Exception:
@@ -296,7 +289,6 @@ def fetch_investorgain_gmp_playwright() -> Dict[str, Dict[str, Any]]:
             browser.close()
 
         soup = BeautifulSoup(html, "html.parser")
-        # same parsing logic as requests version
         table = None
         headings = soup.find_all(lambda tag: tag.name in ("h1", "h2", "h3", "h4") and "gmp" in tag.get_text(strip=True).lower())
         for h in headings:
@@ -348,13 +340,9 @@ def fetch_investorgain_gmp_playwright() -> Dict[str, Dict[str, Any]]:
         return {}
 
 def fetch_investorgain_gmp() -> Dict[str, Dict[str, Any]]:
-    """
-    Try requests parser first, then Playwright fallback.
-    """
     snap = fetch_investorgain_gmp_requests()
     if snap:
         return snap
-    # try playwright only if installed
     try:
         snap2 = fetch_investorgain_gmp_playwright()
         if snap2:
@@ -367,15 +355,9 @@ def fetch_investorgain_gmp() -> Dict[str, Dict[str, Any]]:
 # GMP aggregator (in-memory only, no persistence)
 # -------------------------
 def gather_gmp_for(ipo_key: str) -> Dict[str, Any]:
-    """
-    Aggregate GMP readings from Investorgain snapshot and any configured GMP_SOURCES.
-    DOES NOT persist results to disk — everything is computed and returned.
-    Returns: {"median": float, "sources": [...], "confidence": float} or {} if no readings.
-    """
     readings: List[float] = []
     sources_data: List[Dict[str, Any]] = []
 
-    # 1) Investorgain snapshot
     try:
         snap = fetch_investorgain_gmp()
         rec = snap.get(ipo_key)
@@ -386,7 +368,6 @@ def gather_gmp_for(ipo_key: str) -> Dict[str, Any]:
     except Exception as e:
         print("Error fetching Investorgain snapshot:", e)
 
-    # 2) Additional GMP_SOURCES (optional) parsed with simple parser (requests)
     for url in GMP_SOURCES:
         try:
             r = requests.get(url, timeout=8)
@@ -394,7 +375,6 @@ def gather_gmp_for(ipo_key: str) -> Dict[str, Any]:
                 continue
             parser = PARSERS.get(normalize_domain(url), None)
             if parser is None:
-                # use simple in-place parser
                 val = parse_gmp_from_html_example(r.text)
             else:
                 val = parser(r.text)
